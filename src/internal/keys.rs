@@ -5,14 +5,13 @@
 
 use cbor::{Config, Decoder, Encoder};
 use cbor::skip::Skip;
-use internal::ffi;
+use elliptic::curve25519;
 use internal::types::{DecodeError, DecodeResult, EncodeResult};
 use internal::util::{Bytes64, Bytes32, fmt_hex, opt};
-use sodiumoxide::crypto::scalarmult as ecdh;
-use sodiumoxide::crypto::sign;
 use sodiumoxide::randombytes;
 use std::fmt::{self, Debug, Formatter, Error};
 use std::io::{Cursor, Read, Write};
+use std::slice::bytes::copy_memory;
 use std::u16;
 use std::vec::Vec;
 
@@ -207,7 +206,7 @@ impl PreKeyBundle {
 
     pub fn signed(ident: &IdentityKeyPair, key: &PreKey) -> PreKeyBundle {
         let ratchet_key = key.key_pair.public_key;
-        let signature   = ident.secret_key.sign(&ratchet_key.pub_edward.0);
+        let signature   = ident.secret_key.sign(&ratchet_key.0);
         PreKeyBundle {
             version:      1,
             prekey_id:    key.key_id,
@@ -220,7 +219,7 @@ impl PreKeyBundle {
     pub fn verify(&self) -> PreKeyAuth {
         match self.signature {
             Some(ref sig) =>
-                if self.identity_key.public_key.verify(sig, &self.public_key.pub_edward.0) {
+                if self.identity_key.public_key.verify(sig, &self.public_key.0) {
                     PreKeyAuth::Valid
                 } else {
                     PreKeyAuth::Invalid
@@ -319,20 +318,15 @@ pub struct KeyPair {
 
 impl KeyPair {
     pub fn new() -> KeyPair {
-        let (p, s) = sign::gen_keypair();
-
-        let es = from_ed25519_sk(&s);
-        let ep = from_ed25519_pk(&p);
-
+        let mut sk = [0u8; 32];
+        copy_memory(&rand_bytes(32), &mut sk);
+        sk[0] &= 248;
+        sk[31] &= 127;
+        sk[31] |= 64;
+        let pk = curve25519::keygen(&sk);
         KeyPair {
-            secret_key: SecretKey {
-                sec_edward: s,
-                sec_curve:  ecdh::Scalar(es)
-            },
-            public_key: PublicKey {
-                pub_edward: p,
-                pub_curve:  ecdh::GroupElement(ep)
-            }
+            secret_key: SecretKey(sk),
+            public_key: PublicKey(pk)
         }
     }
 
@@ -363,57 +357,46 @@ impl KeyPair {
 // SecretKey ////////////////////////////////////////////////////////////////
 
 #[derive(Clone)]
-pub struct SecretKey {
-    sec_edward: sign::SecretKey,
-    sec_curve:  ecdh::Scalar
-}
+pub struct SecretKey(pub [u8; 32]);
 
 impl SecretKey {
     pub fn sign(&self, m: &[u8]) -> Signature {
-        Signature { sig: sign::sign_detached(m, &self.sec_edward) }
+        let mut random = [0u8; 64];
+        copy_memory(&rand_bytes(64), &mut random);
+        Signature(curve25519::sign(&self.0, m, &random).unwrap())
     }
 
     pub fn shared_secret(&self, p: &PublicKey) -> [u8; 32] {
-        let ecdh::GroupElement(b) = ecdh::scalarmult(&self.sec_curve, &p.pub_curve);
-        b
+        curve25519::donna(&self.0, &p.0).unwrap()
     }
 
     pub fn encode<W: Write>(&self, e: &mut Encoder<W>) -> EncodeResult<()> {
         try!(e.object(1));
-        try!(e.u8(0).and(e.bytes(&self.sec_edward.0)));
+        try!(e.u8(0).and(e.bytes(&self.0)));
         Ok(())
     }
 
     pub fn decode<R: Read + Skip>(d: &mut Decoder<R>) -> DecodeResult<SecretKey> {
         let n = try!(d.object());
-        let mut sec_edward = None;
+        let mut sk = None;
         for _ in 0 .. n {
             match try!(d.u8()) {
-                0 => sec_edward = Some(try!(Bytes64::decode(d).map(|v| sign::SecretKey(v.array)))),
+                0 => sk = Some(try!(Bytes32::decode(d).map(|v| v.array))),
                 _ => try!(d.skip())
             }
         }
-        let sec_curve = sec_edward.as_ref().map(|ed| ecdh::Scalar(from_ed25519_sk(ed)));
-        Ok(SecretKey {
-            sec_edward: to_field!(sec_edward, "SecretKey::sec_edward"),
-            sec_curve:  to_field!(sec_curve, "SecretKey::sec_curve")
-        })
+        Ok(SecretKey(to_field!(sk, "SecretKey")))
     }
 }
 
 // PublicKey ////////////////////////////////////////////////////////////////
 
 #[derive(Copy, Clone)]
-pub struct PublicKey {
-    pub_edward: sign::PublicKey,
-    pub_curve:  ecdh::GroupElement
-}
+pub struct PublicKey(pub [u8; 32]);
 
 impl PartialEq for PublicKey {
     fn eq(&self, other: &PublicKey) -> bool {
-        &self.pub_edward.0 == &other.pub_edward.0
-            &&
-        &self.pub_curve.0 == &other.pub_curve.0
+        &self.0 == &other.0
     }
 }
 
@@ -421,39 +404,35 @@ impl Eq for PublicKey {}
 
 impl Debug for PublicKey {
     fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
-        write!(f, "{:?}", &self.pub_edward.0)
+        write!(f, "{:?}", &self.0)
     }
 }
 
 impl PublicKey {
     pub fn verify(&self, s: &Signature, m: &[u8]) -> bool {
-        sign::verify_detached(&s.sig, m, &self.pub_edward)
+        curve25519::verify(&s.0, &self.0, &m)
     }
 
     pub fn fingerprint(&self) -> String {
-        fmt_hex(&self.pub_edward.0)
+        fmt_hex(&self.0)
     }
 
     pub fn encode<W: Write>(&self, e: &mut Encoder<W>) -> EncodeResult<()> {
         try!(e.object(1));
-        try!(e.u8(0).and(e.bytes(&self.pub_edward.0)));
+        try!(e.u8(0).and(e.bytes(&self.0)));
         Ok(())
     }
 
     pub fn decode<R: Read + Skip>(d: &mut Decoder<R>) -> DecodeResult<PublicKey> {
         let n = try!(d.object());
-        let mut pub_edward = None;
+        let mut pk = None;
         for _ in 0 .. n {
             match try!(d.u8()) {
-                0 => pub_edward = Some(try!(Bytes32::decode(d).map(|v| sign::PublicKey(v.array)))),
+                0 => pk = Some(try!(Bytes32::decode(d).map(|v| v.array))),
                 _ => try!(d.skip())
             }
         }
-        let pub_curve = pub_edward.as_ref().map(|ed| ecdh::GroupElement(from_ed25519_pk(ed)));
-        Ok(PublicKey {
-            pub_edward: to_field!(pub_edward, "PublicKey::pub_edward"),
-            pub_curve:  to_field!(pub_curve, "PublicKey::pub_curve")
-        })
+        Ok(PublicKey(to_field!(pk, "PublicKey")))
     }
 }
 
@@ -465,15 +444,28 @@ pub fn rand_bytes(size: usize) -> Vec<u8> {
 
 // Signature ////////////////////////////////////////////////////////////////
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Signature {
-    sig: sign::Signature
+pub const SIGNATUREBYTES: usize = 64;
+
+pub struct Signature(pub [u8; SIGNATUREBYTES]);
+
+impl PartialEq for Signature {
+    fn eq(&self, other: &Signature) -> bool {
+        &self.0[..] == &other.0[..]
+    }
+}
+
+impl Eq for Signature {}
+
+impl Debug for Signature {
+    fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
+        write!(f, "{:?}", &self.0[..])
+    }
 }
 
 impl Signature {
     pub fn encode<W: Write>(&self, e: &mut Encoder<W>) -> EncodeResult<()> {
         try!(e.object(1));
-        try!(e.u8(0).and(e.bytes(&self.sig.0)));
+        try!(e.u8(0).and(e.bytes(&self.0)));
         Ok(())
     }
 
@@ -482,33 +474,14 @@ impl Signature {
         let mut sig = None;
         for _ in 0 .. n {
             match try!(d.u8()) {
-                0 => sig = Some(try!(Bytes64::decode(d).map(|v| sign::Signature(v.array)))),
+                0 => sig = Some(try!(Bytes64::decode(d).map(|v| v.array))),
                 _ => try!(d.skip())
             }
         }
-        Ok(Signature {
-            sig: to_field!(sig, "Signature::sig")
-        })
+        Ok(Signature(to_field!(sig, "Signature")))
     }
 }
 
-// Internal /////////////////////////////////////////////////////////////////
-
-pub fn from_ed25519_pk(k: &sign::PublicKey) -> [u8; ecdh::GROUPELEMENTBYTES] {
-    let mut ep = [0u8; ecdh::GROUPELEMENTBYTES];
-    unsafe {
-        ffi::crypto_sign_ed25519_pk_to_curve25519(ep.as_mut_ptr(), (&k.0).as_ptr());
-    }
-    ep
-}
-
-pub fn from_ed25519_sk(k: &sign::SecretKey) -> [u8; ecdh::SCALARBYTES] {
-    let mut es = [0u8; ecdh::SCALARBYTES];
-    unsafe {
-        ffi::crypto_sign_ed25519_sk_to_curve25519(es.as_mut_ptr(), (&k.0).as_ptr());
-    }
-    es
-}
 
 // Tests ////////////////////////////////////////////////////////////////////
 
@@ -554,8 +527,7 @@ mod tests {
     fn enc_dec_seckey() {
         let k = KeyPair::new();
         let r = roundtrip(|mut e| k.secret_key.encode(&mut e), |mut d| SecretKey::decode(&mut d));
-        assert_eq!(&k.secret_key.sec_edward.0[..], &r.sec_edward.0[..]);
-        assert_eq!(&k.secret_key.sec_curve.0[..], &r.sec_curve.0[..])
+        assert_eq!(&k.secret_key.0, &r.0)
     }
 
     #[test]

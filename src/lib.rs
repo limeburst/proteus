@@ -7,8 +7,8 @@
 
 extern crate cbor;
 extern crate byteorder;
+extern crate elliptic;
 extern crate hkdf;
-extern crate libc;
 extern crate sodiumoxide;
 
 pub mod internal;
